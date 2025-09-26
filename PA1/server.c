@@ -1,11 +1,11 @@
 /** @file server.c
- *  @brief Main server logic file used in conjuction
- *  with server.h.
+ * @brief Main server logic file used in conjuction
+ * with server.h.
  *
- *  @usage: ./server <PORT#>
+ * @usage: ./server <PORT#>
  *
- *  @author Joshua Trujillo
- *  @identikey: jotr7489
+ * @author Joshua Trujillo
+ * @identikey: jotr7489
  */
 
 #include "server.h"
@@ -14,6 +14,17 @@
 static int self_pipe[2]; // Cheeky little method to wake up select() so SIGINT is immediate
 
 /* -- Main functions -- */
+
+/**
+ * @brief Safely frees all dynamically allocated memory and closes file 
+ * descriptors associated with a single client-handling thread. This is a 
+ * crucial function for preventing memory leaks and resource exhaustion.
+ * @param client_fd The client's socket file descriptor.
+ * @param arg The dynamically allocated argument passed to the thread.
+ * @param buffer The dynamically allocated buffer for requests.
+ * @param file_name The dynamically allocated string for the file name.
+ * @param response The dynamically allocated buffer for the response.
+ */
 void cleanup_thread_resources(int client_fd, void *arg, 
                             char *buffer, char *file_name, 
                             char *response) 
@@ -35,6 +46,14 @@ void cleanup_thread_resources(int client_fd, void *arg,
     }
 }
 
+/**
+ * @brief Gracefully handles termination signals like SIGINT (from pressing Ctrl+C)
+ * or SIGTERM. It uses the "self-pipe trick" where it writes a single dummy
+ * byte into a pipe. The main server loop is blocked on select(), waiting for
+ * activity on the server socket OR this pipe. Writing to the pipe "wakes up"
+ * select(), allowing the main loop to break and the server to shut down cleanly.
+ * @param signum The signal number that was caught.
+ */
 void handle_signal(int signum)
 {
     (void)signum; // Silence compiler!, For I am the Creator
@@ -44,6 +63,15 @@ void handle_signal(int signum)
     write(self_pipe[1], &dummy, 1);
 }
 
+/**
+ * @brief Creates and sends a standard HTTP error response to the client 
+ * (e.g., 404 Not Found, 403 Forbidden).
+ * @param client_fd The socket file descriptor for the client.
+ * @param status_code The integer HTTP status code (e.g., 404).
+ * @param http_version The HTTP version string (e.g., "HTTP/1.1").
+ * @param keep_alive An integer flag (1 or 0) indicating if the connection
+ * should be kept open.
+ */
 void send_error_response(int client_fd, int status_code, 
                         const char *http_version, int keep_alive) 
 {
@@ -86,6 +114,21 @@ void send_error_response(int client_fd, int status_code,
     send(client_fd, response, strlen(response), 0);
 }
 
+/**
+ * @brief Creates a successful HTTP 200 OK response, including all necessary 
+ * headers and the complete content of the requested file. It efficiently 
+ * builds the entire response (headers and file body) into a single buffer
+ * before sending.
+ * @param file_fd The file descriptor for the open file to be sent.
+ * @param file_name The name of the file, used to determine MIME type.
+ * @param http_version The HTTP version string (e.g., "HTTP/1.1").
+ * @param response The output buffer where the full response will be built.
+ * @param response_len A pointer to a size_t variable that will store the final
+ * total length of the response.
+ * @param total_response_size The total allocated size of the response buffer.
+ * @param keep_alive An integer flag (1 or 0) indicating if the connection
+ * should be kept open.
+ */
 void build_http_response(int file_fd, const char *file_name, 
                         const char *http_version, 
                         char *response, size_t *response_len, 
@@ -117,6 +160,13 @@ void build_http_response(int file_fd, const char *file_name,
     }
 }
 
+/**
+ * @brief A simple utility function to extract the extension from a file name.
+ * It finds the last occurrence of a '.' character in the file name and returns
+ * a pointer to the character that follows it.
+ * @param file_name The full name of the file.
+ * @return A pointer to the start of the file extension string.
+ */
 const char *get_file_extension(const char *file_name)
 {
     const char *dot = strrchr(file_name, '.');
@@ -127,6 +177,13 @@ const char *get_file_extension(const char *file_name)
     return dot + 1;
 }
 
+/**
+ * @brief Maps a file extension to its corresponding standard MIME type. This is
+ * necessary for the browser to correctly interpret the content being sent.
+ * It defaults to "application/octet-stream" for unknown file types.
+ * @param file_ext The file extension string (e.g., "html", "jpg").
+ * @return A string literal representing the MIME type.
+ */
 const char *get_mime_type(const char *file_ext)
 {
     if (strcasecmp(file_ext, "html") == 0 || strcasecmp(file_ext, "htm") == 0 )
@@ -158,6 +215,15 @@ const char *get_mime_type(const char *file_ext)
     }
 }
 
+/**
+ * @brief Decodes a URL-encoded string. Web browsers replace special characters
+ * in URLs with '%' followed by a two-digit hexadecimal code (e.g., a space
+ * becomes "%20"). This function converts those codes back into their actual
+ * characters.
+ * @param str The URL-encoded input string.
+ * @return A new, dynamically allocated string with the URL decoded. The caller
+ * is responsible for freeing this memory.
+ */
 char *url_decode(const char *str) 
 {
     size_t str_len = strlen(str);
@@ -186,6 +252,12 @@ char *url_decode(const char *str)
     return decoded;
 }
 
+/**
+ * @brief Checks the "Connection:" header in an HTTP request to see if the
+ * client has requested to use a persistent connection ("keep-alive").
+ * @param buffer The buffer containing the full HTTP request from the client.
+ * @return 1 if "Connection: Keep-alive" is found, 0 otherwise.
+ */
 int parse_connection_header(const char *buffer) {
     // Look for Connection header in the request
     const char *connection_line = strcasestr(buffer, "Connection:");
@@ -201,6 +273,32 @@ int parse_connection_header(const char *buffer) {
     return 0; // Default to close
 }
 
+/**
+ * @brief The core worker function that runs in its own thread for each 
+ * connected client. It is responsible for reading, parsing, and responding 
+ * to one or more HTTP requests from that client. It supports HTTP pipelining
+ * by looping to process multiple requests on the same connection if it is
+ * kept alive.
+ * * @details
+ * 1.  **Setup**: Allocates a buffer and sets a socket timeout to prevent hangs.
+ * 2.  **Main Loop**: Enters a loop to handle multiple requests on one connection.
+ * 3.  **Receive & Parse**: Reads data, looks for the end-of-headers marker
+ * ("\r\n\r\n"), and parses the request line (method, URI, version).
+ * 4.  **Validation & Security**:
+ * - Determines `keep-alive` status.
+ * - Validates the method (`GET`), HTTP version, and presence of `Host` header.
+ * - Prevents path traversal attacks by checking for ".." and using `realpath()`
+ * to ensure the requested file is within the designated web root directory.
+ * 5.  **Serve File**: If all checks pass, it opens the file, calls 
+ * `build_http_response()` to construct the full response, and sends it.
+ * 6.  **Pipelining Support**: After processing, it uses `memmove()` to shift any
+ * remaining data in the buffer to the beginning, preparing for the next request.
+ * 7.  **Cleanup**: When the loop ends (connection closes), it calls
+ * `cleanup_thread_resources()` to free all memory and close the socket.
+ * * @param arg A void pointer to a dynamically allocated integer containing the
+ * client's socket file descriptor.
+ * @return NULL when the thread is finished.
+ */
 void *handle_client(void *arg) 
 {
     const char *web_root = DIRECTORY;
@@ -359,6 +457,29 @@ void *handle_client(void *arg)
     return NULL;
 }
 
+/**
+ * @brief The entry point of the server application. It is responsible for
+ * setting up the listening socket, accepting incoming client connections,
+ * and creating a new thread for each one. It also sets up signal handling
+ * for a graceful shutdown.
+ * * @details
+ * 1.  **Argument Check**: Verifies that the user provided a port number.
+ * 2.  **Socket Setup**: Performs the standard `socket()`, `setsockopt()`, `bind()`,
+ * and `listen()` sequence to prepare the server to accept connections.
+ * 3.  **Signal & Pipe Setup**: Creates the self-pipe and registers the
+ * `handle_signal` function for graceful shutdown on `SIGINT` or `SIGTERM`.
+ * 4.  **Event Loop**: Enters the main `while(1)` loop, using `select()` to wait
+ * for activity on either the listening socket (new connection) or the
+ * self-pipe (shutdown signal).
+ * 5.  **Thread Creation**: When a new connection is accepted via `accept()`, it
+ * creates a new, detached thread using `pthread_create()` and `pthread_detach()`,
+ * assigning the `handle_client` function to manage that specific client.
+ * 6.  **Shutdown**: Once the loop is broken by a signal, it prints a shutdown
+ * message and closes all open file descriptors before exiting.
+ * * @param argc The number of command-line arguments.
+ * @param argv An array of command-line argument strings.
+ * @return 0 on successful shutdown, non-zero on failure.
+ */
 int main(int argc, char** argv)
 {
     if (argc != 2)
